@@ -1,10 +1,8 @@
 package com.fofinhos.bydproxy
 
 import android.util.Log
-import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
-import java.io.InputStreamReader
 import java.io.OutputStream
 import java.io.PushbackInputStream
 import java.net.DatagramPacket
@@ -17,31 +15,55 @@ import java.util.concurrent.atomic.AtomicInteger
 class ProxyWorker(private val clientSocket: Socket, private val executor: ExecutorService) : Runnable {
 
     override fun run() {
+        var targetSocket: Socket? = null
         try {
+            // Define um timeout curto de 5 segundos apenas para o aperto de mão inicial.
+            clientSocket.soTimeout = 5000
+
             val clientInRaw = clientSocket.getInputStream()
             val clientOut = clientSocket.getOutputStream()
-            
+
             val pushbackIn = PushbackInputStream(clientInRaw, 1)
+
+            // LER O PRIMEIRO BYTE: Bloqueia a execução até que o telemóvel envie o primeiro sinal.
             val firstByte = pushbackIn.read()
-            
+
+            if (firstByte == -1) {
+                return
+            }
+
+            // Repõe o timeout para zero (infinito) para o tráfego de dados fluir sem cair por inatividade
+            clientSocket.soTimeout = 0
+
+            Log.d("ProxyWorker", "Primeiro byte detetado: 0x${Integer.toHexString(firstByte)}")
+
             if (firstByte == 0x05) {
-                handleSocks5(pushbackIn, clientOut)
-            } else if (firstByte != -1) {
+                targetSocket = handleSocks5(pushbackIn, clientOut)
+            } else {
                 pushbackIn.unread(firstByte)
-                handleHttp(pushbackIn, clientOut)
+                targetSocket = handleHttp(pushbackIn, clientOut)
+            }
+
+            // Se o socket de destino foi aberto com sucesso, inicia o relay bidirecional
+            if (targetSocket != null) {
+                targetSocket.soTimeout = 0
+                val targetIn = targetSocket.getInputStream()
+                val targetOut = targetSocket.getOutputStream()
+                relay(pushbackIn, clientOut, targetIn, targetOut, targetSocket)
             }
 
         } catch (e: Exception) {
-            Log.e("ProxyWorker", "Error in ProxyWorker: ${e.message}")
+            Log.e("ProxyWorker", "Erro geral no ProxyWorker: ${e.message}")
         } finally {
             try { clientSocket.close() } catch (_: Exception) {}
+            try { targetSocket?.close() } catch (_: Exception) {}
         }
     }
 
-    private fun handleSocks5(clientIn: InputStream, clientOut: OutputStream) {
+    private fun handleSocks5(clientIn: InputStream, clientOut: OutputStream): Socket? {
         // 1. Handshake (Method Selection)
         val nMethods = clientIn.read()
-        if (nMethods < 1) return
+        if (nMethods < 1) return null
         val methods = ByteArray(nMethods)
         clientIn.read(methods)
 
@@ -51,7 +73,7 @@ class ProxyWorker(private val clientSocket: Socket, private val executor: Execut
 
         // 2. Request
         val version = clientIn.read()
-        if (version != 0x05) return
+        if (version != 0x05) return null
         val cmd = clientIn.read()
         clientIn.read() // Skip RSV
         val atyp = clientIn.read()
@@ -64,12 +86,12 @@ class ProxyWorker(private val clientSocket: Socket, private val executor: Execut
             }
             clientIn.read(); clientIn.read() // Skip Port
             handleUdpAssociate(clientIn, clientOut)
-            return
+            return null
         }
 
         if (cmd != 0x01) { // Apenas CONNECT suportado
             clientOut.write(byteArrayOf(0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0)) // Command not supported
-            return
+            return null
         }
 
         val host: String
@@ -90,38 +112,42 @@ class ProxyWorker(private val clientSocket: Socket, private val executor: Execut
                 clientIn.read(addr)
                 host = InetAddress.getByAddress(addr).hostAddress ?: ""
             }
-            else -> return
+            else -> return null
         }
 
-        val port = ((clientIn.read() and 0xFF) shl 8) or (clientIn.read() and 0xFF)
+        val p1 = clientIn.read()
+        val p2 = clientIn.read()
+        if (p1 == -1 || p2 == -1) return null
+        val port = (p1 shl 8) or p2
 
         Log.d("ProxyWorker", "SOCKS5 Connecting to $host:$port")
         val targetSocket = Socket()
         targetSocket.connect(java.net.InetSocketAddress(host, port), 10000)
-        targetSocket.soTimeout = 30000
-        val targetIn = targetSocket.getInputStream()
-        val targetOut = targetSocket.getOutputStream()
 
         // 3. Resposta de conexão bem-sucedida
         val response = byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0)
         clientOut.write(response)
         clientOut.flush()
 
-        // 4. Relay bidirecional
-        relay(clientIn, clientOut, targetIn, targetOut, targetSocket)
+        return targetSocket
     }
 
-    private fun handleHttp(clientIn: InputStream, clientOut: OutputStream) {
-        val reader = BufferedReader(InputStreamReader(clientIn))
-        val firstLine = reader.readLine() ?: return
-        if (firstLine.isEmpty()) return
+    private fun handleHttp(clientIn: InputStream, clientOut: OutputStream): Socket? {
+        val bout = ByteArrayOutputStream()
+        var b: Int
+        while (clientIn.read().also { b = it } != -1) {
+            bout.write(b)
+            if (b == '\n'.code) break
+        }
+
+        val firstLine = bout.toString("UTF-8").trim()
+        if (firstLine.isEmpty()) return null
 
         val parts = firstLine.split(" ")
-        if (parts.size < 2) return
+        if (parts.size < 2) return null
 
         val method = parts[0]
         val url = parts[1]
-
 
         // Servir o arquivo PAC se solicitado
         if (url.endsWith("/proxy.pac") || url == "proxy.pac") {
@@ -149,7 +175,7 @@ class ProxyWorker(private val clientSocket: Socket, private val executor: Execut
 
             clientOut.write(response.toByteArray())
             clientOut.flush()
-            return
+            return null
         }
 
         var host = url
@@ -171,8 +197,6 @@ class ProxyWorker(private val clientSocket: Socket, private val executor: Execut
         Log.d("ProxyWorker", "HTTP $method $host:$port")
         val targetSocket = Socket()
         targetSocket.connect(java.net.InetSocketAddress(host, port), 10000)
-        targetSocket.soTimeout = 30000
-        val targetIn = targetSocket.getInputStream()
         val targetOut = targetSocket.getOutputStream()
 
         if (method == "CONNECT") {
@@ -185,7 +209,7 @@ class ProxyWorker(private val clientSocket: Socket, private val executor: Execut
             targetOut.flush()
         }
 
-        relay(clientIn, clientOut, targetIn, targetOut, targetSocket)
+        return targetSocket
     }
 
     private fun relay(clientIn: InputStream, clientOut: OutputStream, targetIn: InputStream, targetOut: OutputStream, targetSocket: Socket) {

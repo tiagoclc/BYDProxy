@@ -29,7 +29,7 @@ class ProxyWorker(private val clientSocket: Socket) : Runnable {
         } catch (e: Exception) {
             Log.e("ProxyWorker", "Error in ProxyWorker: ${e.message}")
         } finally {
-            try { clientSocket.close() } catch (e: Exception) {}
+            try { clientSocket.close() } catch (_: Exception) {}
         }
     }
 
@@ -103,6 +103,30 @@ class ProxyWorker(private val clientSocket: Socket) : Runnable {
 
         val method = parts[0]
         val url = parts[1]
+
+
+        // Servir o arquivo PAC se solicitado
+        if (url.endsWith("/proxy.pac") || url == "proxy.pac") {
+            val localAddress = clientSocket.localAddress.hostAddress ?: "127.0.0.1"
+            val localPort = clientSocket.localPort
+
+            val pacContent = """
+                function FindProxyForURL(url, host) {
+                    if (isPlainHostName(host) || shExpMatch(host, "*.local")) return "DIRECT";
+                    return "SOCKS5 $localAddress:$localPort; PROXY $localAddress:$localPort; DIRECT";
+                }
+            """.trimIndent()
+
+            val response = "HTTP/1.1 200 OK\r\n" +
+                    "Content-Type: application/x-ns-proxy-autoconfig\r\n" +
+                    "Content-Length: ${pacContent.toByteArray().size}\r\n" +
+                    "Connection: close\r\n\r\n" +
+                    pacContent
+
+            clientOut.write(response.toByteArray())
+            clientOut.flush()
+            return
+        }
 
         var host = url
         var port = 80

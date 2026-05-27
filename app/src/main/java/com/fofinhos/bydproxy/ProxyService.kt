@@ -51,14 +51,22 @@ class ProxyService : Service() {
         executorService?.execute {
             try {
                 serverSocket = ServerSocket(PROXY_PORT)
+                serverSocket?.soTimeout = 5000 // Timeout para o accept() poder checar isRunning
                 Log.d("ProxyService", "ServerSocket opened successfully")
                 while (isRunning) {
-                    val clientSocket = serverSocket?.accept() ?: break
-                    Log.d("ProxyService", "Accepted new connection")
-                    executorService?.execute(ProxyWorker(clientSocket))
+                    try {
+                        val clientSocket = serverSocket?.accept() ?: break
+                        clientSocket.soTimeout = 30000 // 30s timeout para operações iniciais
+                        Log.d("ProxyService", "Accepted new connection")
+                        executorService?.execute(ProxyWorker(clientSocket, executorService!!))
+                    } catch (_: IOException) {
+                        // Provavelmente timeout do accept, apenas continua se isRunning
+                    }
                 }
             } catch (e: IOException) {
                 Log.e("ProxyService", "Error in Proxy Server", e)
+            } finally {
+                isRunning = false
             }
         }
     }

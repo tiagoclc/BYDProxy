@@ -14,36 +14,32 @@ class AdbLoopbackClient {
 
     fun executeShellCommand(command: String) {
         Thread {
-            var connected = false
-            while (!connected) {
-                var socket: Socket? = null
-                try {
-                    Log.d("AdbLoopback", "Tentando conectar ao ADB (127.0.0.1:5555)...")
-                    socket = Socket("127.0.0.1", 5555)
-                    val outputStream = socket.getOutputStream()
-                    val inputStream = socket.getInputStream()
+            var socket: Socket? = null
+            try {
+                Log.d("AdbLoopback", "Tentando conectar ao ADB (127.0.0.1:5555)...")
+                socket = Socket()
+                socket.connect(java.net.InetSocketAddress("127.0.0.1", 5555), 5000)
+                val outputStream = socket.getOutputStream()
+                val inputStream = socket.getInputStream()
 
-                    sendAdbMessage(outputStream, A_CNXN, 0x01000000, 4096, "host::\u0000")
+                sendAdbMessage(outputStream, A_CNXN, 0x01000000, 4096, "host::\u0000")
 
-                    val header = ByteArray(24)
-                    if (inputStream.read(header) == -1) {
-                        Log.e("AdbLoopback", "Falha ao ler cabeçalho de resposta")
-                        throw Exception("Read failed")
-                    }
-
-                    Log.d("AdbLoopback", "Conexão estabelecida! Enviando comando: $command")
-                    val destination = "shell:$command\u0000"
-                    sendAdbMessage(outputStream, A_OPEN, 1, 0, destination)
-                    
-                    connected = true
-                    Log.d("AdbLoopback", "Comando enviado com sucesso!")
-
-                } catch (e: Exception) {
-                    Log.e("AdbLoopback", "Erro na conexão ADB: ${e.message}. A porta 5555 está aberta? Tentando em 5s...")
-                    try { Thread.sleep(5000) } catch (te: InterruptedException) {}
-                } finally {
-                    try { socket?.close() } catch (e: Exception) {}
+                val header = ByteArray(24)
+                socket.soTimeout = 5000
+                if (inputStream.read(header) == -1) {
+                    Log.e("AdbLoopback", "Falha ao ler cabeçalho de resposta")
+                    return@Thread
                 }
+
+                Log.d("AdbLoopback", "Conexão estabelecida! Enviando comando: $command")
+                val destination = "shell:$command\u0000"
+                sendAdbMessage(outputStream, A_OPEN, 1, 0, destination)
+                Log.d("AdbLoopback", "Comando enviado com sucesso!")
+
+            } catch (e: Exception) {
+                Log.e("AdbLoopback", "Erro na conexão ADB: ${e.message}. A porta 5555 está aberta?")
+            } finally {
+                try { socket?.close() } catch (e: Exception) {}
             }
         }.start()
     }

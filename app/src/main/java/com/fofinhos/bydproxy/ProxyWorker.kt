@@ -11,9 +11,10 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.Socket
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.atomic.AtomicInteger
 
-class ProxyWorker(private val clientSocket: Socket) : Runnable {
+class ProxyWorker(private val clientSocket: Socket, private val executor: ExecutorService) : Runnable {
 
     override fun run() {
         try {
@@ -95,7 +96,9 @@ class ProxyWorker(private val clientSocket: Socket) : Runnable {
         val port = ((clientIn.read() and 0xFF) shl 8) or (clientIn.read() and 0xFF)
 
         Log.d("ProxyWorker", "SOCKS5 Connecting to $host:$port")
-        val targetSocket = Socket(host, port)
+        val targetSocket = Socket()
+        targetSocket.connect(java.net.InetSocketAddress(host, port), 10000)
+        targetSocket.soTimeout = 30000
         val targetIn = targetSocket.getInputStream()
         val targetOut = targetSocket.getOutputStream()
 
@@ -105,7 +108,7 @@ class ProxyWorker(private val clientSocket: Socket) : Runnable {
         clientOut.flush()
 
         // 4. Relay bidirecional
-        relay(clientIn, clientOut, targetIn, targetOut)
+        relay(clientIn, clientOut, targetIn, targetOut, targetSocket)
     }
 
     private fun handleHttp(clientIn: InputStream, clientOut: OutputStream) {
@@ -166,7 +169,9 @@ class ProxyWorker(private val clientSocket: Socket) : Runnable {
         }
 
         Log.d("ProxyWorker", "HTTP $method $host:$port")
-        val targetSocket = Socket(host, port)
+        val targetSocket = Socket()
+        targetSocket.connect(java.net.InetSocketAddress(host, port), 10000)
+        targetSocket.soTimeout = 30000
         val targetIn = targetSocket.getInputStream()
         val targetOut = targetSocket.getOutputStream()
 
@@ -180,21 +185,26 @@ class ProxyWorker(private val clientSocket: Socket) : Runnable {
             targetOut.flush()
         }
 
-        relay(clientIn, clientOut, targetIn, targetOut)
+        relay(clientIn, clientOut, targetIn, targetOut, targetSocket)
     }
 
-    private fun relay(clientIn: InputStream, clientOut: OutputStream, targetIn: InputStream, targetOut: OutputStream) {
-        val clientToTarget = Thread { pipe(clientIn, targetOut) }
-        val targetToClient = Thread { pipe(targetIn, clientOut) }
-
-        clientToTarget.start()
-        targetToClient.start()
+    private fun relay(clientIn: InputStream, clientOut: OutputStream, targetIn: InputStream, targetOut: OutputStream, targetSocket: Socket) {
+        // Usa o executor para UMA direção, e a thread atual para a outra.
+        // Isso economiza uma thread por conexão (2 em vez de 3).
+        executor.execute {
+            try {
+                pipe(targetIn, clientOut)
+            } finally {
+                try { clientSocket.close() } catch (_: Exception) {}
+                try { targetSocket.close() } catch (_: Exception) {}
+            }
+        }
 
         try {
-            clientToTarget.join()
-            targetToClient.join()
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
+            pipe(clientIn, targetOut)
+        } finally {
+            try { clientSocket.close() } catch (_: Exception) {}
+            try { targetSocket.close() } catch (_: Exception) {}
         }
     }
 
@@ -216,6 +226,7 @@ class ProxyWorker(private val clientSocket: Socket) : Runnable {
 
     private fun handleUdpAssociate(clientIn: InputStream, clientOut: OutputStream) {
         val serverUdpSocket = DatagramSocket(0)
+        serverUdpSocket.soTimeout = 30000
         val serverUdpPort = serverUdpSocket.localPort
         val serverLocalAddr = clientSocket.localAddress
 
@@ -241,95 +252,108 @@ class ProxyWorker(private val clientSocket: Socket) : Runnable {
         val learnedClientUdpPort = AtomicInteger(-1)
 
         val targetUdpSocket = DatagramSocket()
+        targetUdpSocket.soTimeout = 30000
 
-        val clientToTarget = Thread {
-            val buffer = ByteArray(65535)
+        executor.execute {
+            val buffer = ByteArray(16384) // Reduzido de 65k para economizar memória
             try {
-                while (!clientSocket.isClosed) {
-                    val packet = DatagramPacket(buffer, buffer.size)
-                    serverUdpSocket.receive(packet)
+                while (!clientSocket.isClosed && !serverUdpSocket.isClosed) {
+                    try {
+                        val packet = DatagramPacket(buffer, buffer.size)
+                        serverUdpSocket.receive(packet)
 
-                    if (packet.address != clientAddr) {
-                        Log.w("ProxyWorker", "UDP packet from unknown source: ${packet.address}")
-                        continue
+                        if (packet.address != clientAddr) {
+                            Log.w("ProxyWorker", "UDP packet from unknown source: ${packet.address}")
+                            continue
+                        }
+                        learnedClientUdpPort.set(packet.port)
+
+                        val data = packet.data
+                        // SOCKS5 UDP Header: RSV(2), FRAG(1), ATYP(1), DST.ADDR, DST.PORT
+                        if (data[2].toInt() != 0) continue // Ignorar fragmentação
+
+                        val atyp = data[3].toInt()
+                        var pos = 4
+                        val targetHost: String
+                        when (atyp) {
+                            0x01 -> {
+                                val addr = ByteArray(4)
+                                System.arraycopy(data, pos, addr, 0, 4)
+                                targetHost = InetAddress.getByAddress(addr).hostAddress ?: ""
+                                pos += 4
+                            }
+                            0x03 -> {
+                                val len = data[pos].toInt() and 0xFF
+                                targetHost = String(data, pos + 1, len)
+                                pos += 1 + len
+                            }
+                            0x04 -> {
+                                val addr = ByteArray(16)
+                                System.arraycopy(data, pos, addr, 0, 16)
+                                targetHost = InetAddress.getByAddress(addr).hostAddress ?: ""
+                                pos += 16
+                            }
+                            else -> continue
+                        }
+                        val targetPort = ((data[pos].toInt() and 0xFF) shl 8) or (data[pos + 1].toInt() and 0xFF)
+                        pos += 2
+
+                        val payloadLen = packet.length - pos
+                        val targetPacket = DatagramPacket(data, pos, payloadLen, InetAddress.getByName(targetHost), targetPort)
+                        targetUdpSocket.send(targetPacket)
+                    } catch (e: Exception) {
+                        // Timeout ou Socket fechado
                     }
-                    learnedClientUdpPort.set(packet.port)
-
-                    val data = packet.data
-                    // SOCKS5 UDP Header: RSV(2), FRAG(1), ATYP(1), DST.ADDR, DST.PORT
-                    if (data[2].toInt() != 0) continue // Ignorar fragmentação
-
-                    val atyp = data[3].toInt()
-                    var pos = 4
-                    val targetHost: String
-                    when (atyp) {
-                        0x01 -> {
-                            val addr = ByteArray(4)
-                            System.arraycopy(data, pos, addr, 0, 4)
-                            targetHost = InetAddress.getByAddress(addr).hostAddress ?: ""
-                            pos += 4
-                        }
-                        0x03 -> {
-                            val len = data[pos].toInt() and 0xFF
-                            targetHost = String(data, pos + 1, len)
-                            pos += 1 + len
-                        }
-                        0x04 -> {
-                            val addr = ByteArray(16)
-                            System.arraycopy(data, pos, addr, 0, 16)
-                            targetHost = InetAddress.getByAddress(addr).hostAddress ?: ""
-                            pos += 16
-                        }
-                        else -> continue
-                    }
-                    val targetPort = ((data[pos].toInt() and 0xFF) shl 8) or (data[pos + 1].toInt() and 0xFF)
-                    pos += 2
-
-                    val payloadLen = packet.length - pos
-                    val targetPacket = DatagramPacket(data, pos, payloadLen, InetAddress.getByName(targetHost), targetPort)
-                    targetUdpSocket.send(targetPacket)
                 }
             } catch (e: Exception) {
                 // Fim da associação
+            } finally {
+                serverUdpSocket.close()
+                targetUdpSocket.close()
             }
         }
 
-        val targetToClient = Thread {
-            val buffer = ByteArray(65535)
+        executor.execute {
+            val buffer = ByteArray(16384) // Reduzido
             try {
-                while (!clientSocket.isClosed) {
-                    val packet = DatagramPacket(buffer, buffer.size)
-                    targetUdpSocket.receive(packet)
+                while (!clientSocket.isClosed && !targetUdpSocket.isClosed) {
+                    try {
+                        val packet = DatagramPacket(buffer, buffer.size)
+                        targetUdpSocket.receive(packet)
 
-                    val port = learnedClientUdpPort.get()
-                    if (port == -1) continue
+                        val port = learnedClientUdpPort.get()
+                        if (port == -1) continue
 
-                    val out = ByteArrayOutputStream()
-                    out.write(byteArrayOf(0, 0, 0)) // RSV, FRAG
-                    val senderAddr = packet.address.address
-                    if (senderAddr.size == 4) {
-                        out.write(0x01)
-                    } else {
-                        out.write(0x04)
+                        val out = ByteArrayOutputStream()
+                        out.write(byteArrayOf(0, 0, 0)) // RSV, FRAG
+                        val senderAddr = packet.address.address
+                        if (senderAddr.size == 4) {
+                            out.write(0x01)
+                        } else {
+                            out.write(0x04)
+                        }
+                        out.write(senderAddr)
+                        out.write((packet.port shr 8) and 0xFF)
+                        out.write(packet.port and 0xFF)
+                        out.write(packet.data, packet.offset, packet.length)
+
+                        val relayPacket = DatagramPacket(out.toByteArray(), out.size(), clientAddr, port)
+                        serverUdpSocket.send(relayPacket)
+                    } catch (e: Exception) {
+                        // Timeout ou Socket fechado
                     }
-                    out.write(senderAddr)
-                    out.write((packet.port shr 8) and 0xFF)
-                    out.write(packet.port and 0xFF)
-                    out.write(packet.data, packet.offset, packet.length)
-
-                    val relayPacket = DatagramPacket(out.toByteArray(), out.size(), clientAddr, port)
-                    serverUdpSocket.send(relayPacket)
                 }
             } catch (e: Exception) {
                 // Fim da associação
+            } finally {
+                serverUdpSocket.close()
+                targetUdpSocket.close()
             }
         }
-
-        clientToTarget.start()
-        targetToClient.start()
 
         try {
             // A associação UDP deve durar enquanto a conexão TCP estiver aberta
+            clientSocket.soTimeout = 0 // Espera infinita no TCP para UDP Associate
             while (clientIn.read() != -1) {}
         } catch (e: Exception) {} finally {
             serverUdpSocket.close()

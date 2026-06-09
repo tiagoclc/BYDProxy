@@ -251,7 +251,7 @@ class ProxyService : Service() {
             adb.executeShellCommand("touch $logFile")
             adb.executeShellCommand("chmod 777 $logFile")
 
-            val cmdTmp = "nohup $tmpBin run -c $tmpConfig > $logFile 2>&1 &"
+            val cmdTmp = "$tmpBin run -c $tmpConfig > $logFile 2>&1 &"
             Log.d("ProxyService", "A iniciar processo do Motor (Direct mode)...")
             adb.executeShellCommand(cmdTmp)
 

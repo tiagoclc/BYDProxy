@@ -47,15 +47,12 @@ class ProxyService : Service() {
             try {
                 adbClient.executeShellCommand("dumpsys deviceidle whitelist +com.fofinhos.bydproxy")
 
-                // Otimizações de Kernel mais conservadoras para estabilidade HTTPS
-                adbClient.executeShellCommand("sysctl -w net.ipv4.tcp_window_scaling=1")
-                adbClient.executeShellCommand("sysctl -w net.core.rmem_max=1048576")
-                adbClient.executeShellCommand("sysctl -w net.core.wmem_max=1048576")
-                adbClient.executeShellCommand("sysctl -w net.ipv4.tcp_mtu_probing=1")
-
                 // Forçar sincronização de relógio para evitar rejeição de certificados TLS
-                adbClient.executeShellCommand("settings put global auto_time 1")
-                adbClient.executeShellCommand("settings put global auto_time_zone 1")
+                // Isso é CRÍTICO para evitar "Security Error"
+
+
+                // Remover sysctls que podem causar fragmentação e erro de SSL/TLS em emuladores
+//                adbClient.executeShellCommand("sysctl -w net.ipv4.tcp_window_scaling=1")
             } catch (e: Exception) {
                 Log.e("ProxyService", "Erro ao executar comandos ADB iniciais", e)
             }
@@ -220,7 +217,8 @@ class ProxyService : Service() {
                   "listen": "0.0.0.0",
                   "listen_port": $SINGBOX_PORT,
                   "sniff": true,
-                  "domain_strategy": "prefer_ipv4"
+                  "sniff_timeout": "3000ms",
+                  "domain_strategy": "ipv4_only"
                 },
                 {
                   "type": "http",
@@ -228,7 +226,8 @@ class ProxyService : Service() {
                   "listen": "0.0.0.0",
                   "listen_port": $SINGBOX_HTTP_PORT,
                   "sniff": true,
-                  "domain_strategy": "prefer_ipv4"
+                  "sniff_timeout": "3000ms",
+                  "domain_strategy": "ipv4_only"
                 }
               ],
               "outbounds": [

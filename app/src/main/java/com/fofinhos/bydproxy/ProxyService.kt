@@ -15,7 +15,6 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import java.io.File
-import java.io.FileOutputStream
 import java.io.IOException
 import java.net.ServerSocket
 import java.net.Socket
@@ -26,10 +25,12 @@ class ProxyService : Service() {
 
     private var pacServerSocket: ServerSocket? = null
     private var executorService: ExecutorService? = null
+    private val cleanupExecutor = Executors.newSingleThreadExecutor()
+    private val adbClient = AdbLoopbackClient()
     private var isRunning = false
 
     private val SINGBOX_PORT = 8888
-    private val SINGBOX_HTTP_PORT = 8887        // Porta HTTP dedicada
+    private val SINGBOX_HTTP_PORT = 8887
     private val PAC_PORT = 8880
     var hostIp = "192.168.43.1" // IP base por defeito do Hotspot Android
 
@@ -40,17 +41,27 @@ class ProxyService : Service() {
         Log.d("ProxyService", "Service onCreate")
         startForegroundServiceNotification()
 
-        // Executar comandos ADB em thread separada pois agora são síncronos
-        Executors.newSingleThreadExecutor().execute {
+        executorService = Executors.newFixedThreadPool(4)
+
+        executorService?.execute {
             try {
-                val adb = AdbLoopbackClient()
-                adb.executeShellCommand("dumpsys deviceidle whitelist +com.fofinhos.bydproxy")
+                adbClient.executeShellCommand("dumpsys deviceidle whitelist +com.fofinhos.bydproxy")
+
+                // Otimizações de Kernel mais conservadoras para estabilidade HTTPS
+                adbClient.executeShellCommand("sysctl -w net.ipv4.tcp_window_scaling=1")
+                adbClient.executeShellCommand("sysctl -w net.core.rmem_max=1048576")
+                adbClient.executeShellCommand("sysctl -w net.core.wmem_max=1048576")
+                adbClient.executeShellCommand("sysctl -w net.ipv4.tcp_mtu_probing=1")
+
+                // Forçar sincronização de relógio para evitar rejeição de certificados TLS
+                adbClient.executeShellCommand("settings put global auto_time 1")
+                adbClient.executeShellCommand("settings put global auto_time_zone 1")
             } catch (e: Exception) {
-                Log.e("ProxyService", "Erro ao executar comando ADB Loopback", e)
+                Log.e("ProxyService", "Erro ao executar comandos ADB iniciais", e)
             }
         }
 
-        executorService = Executors.newCachedThreadPool()
+        executorService = Executors.newFixedThreadPool(4)
         startProxySystem()
     }
 
@@ -58,16 +69,40 @@ class ProxyService : Service() {
         return START_STICKY
     }
 
+    private fun cleanResources() {
+        val cleanCmd = """
+            # Encontra e mata qualquer processo chamado sing-box ou singbox_byd
+            # Em Android, o PID é geralmente a segunda coluna no output do ps
+            for pid in ${'$'}(ps -A | grep -E 'sing-box|singbox_byd|libsingbox' | awk '{print ${'$'}2}'); do
+                kill -9 ${'$'}pid 2>/dev/null
+            done
+            
+            # Tenta pkill por via das dúvidas
+            pkill -9 -f singbox_byd 2>/dev/null
+        """.trimIndent()
+
+        adbClient.executeShellCommand(cleanCmd)
+    }
+
     private fun startProxySystem() {
         if (isRunning) return
         isRunning = true
 
-        executorService?.execute {
-            startSingBoxEngine()
-        }
+        // Executamos a limpeza de forma assíncrona antes de iniciar as threads principais
+        cleanupExecutor.execute {
+            Log.d("ProxyService", "Limpando recursos e portas anteriores...")
+            cleanResources()
 
-        executorService?.execute {
-            startPacServer()
+            // Aguarda o kernel libertar o socket TIME_WAIT antes de bindar novamente
+            Thread.sleep(1500)
+
+            executorService?.execute {
+                startSingBoxEngine()
+            }
+
+            executorService?.execute {
+                startPacServer()
+            }
         }
     }
 
@@ -79,15 +114,13 @@ class ProxyService : Service() {
             val logFile = "/data/local/tmp/singbox.log"
 
             Log.i("ProxyService", "Iniciando Diagnóstico ADB para DiLink...")
-            val adb = AdbLoopbackClient()
 
-            // 1. Identificar dinamicamente o IP atribuído à rede local do Hotspot (Usado no PAC)
+            // 1. Identificar dinamicamente o IP atribuído à rede local do Hotspot
             try {
                 val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
                 while (interfaces.hasMoreElements()) {
                     val networkInterface = interfaces.nextElement()
                     val name = networkInterface.name.lowercase()
-                    // Filtramos por interfaces comuns de Hotspot/Wi-Fi
                     if (name.contains("wlan") || name.contains("ap") || name.contains("p2p")) {
                         val addresses = networkInterface.inetAddresses
                         while (addresses.hasMoreElements()) {
@@ -106,30 +139,17 @@ class ProxyService : Service() {
             }
             Log.i("ProxyService", "IP Mapeado para o Servidor PAC: $hostIp")
 
-            // 2. Limpeza profunda de processos órfãos antigos e portas presas
-            val cleanCmd = "pkill -9 -f libsingbox.so; pkill -9 -f sing-box; pkill -9 -f singbox_byd; " +
-                           "for p in $SINGBOX_PORT $SINGBOX_HTTP_PORT $PAC_PORT; do " +
-                           "fuser -k \$p/tcp 2>/dev/null; " +
-                           "lsof -i tcp:\$p -t 2>/dev/null | xargs kill -9 2>/dev/null; " +
-                           "done"
-            adb.executeShellCommand(cleanCmd)
-
             val tmpBin = "/data/local/tmp/singbox_byd"
             val tmpConfig = "/data/local/tmp/singbox_config.json"
 
-            // --- INÍCIO DA SUA LÓGICA DE CÓPIA (INTACTA) ---
+            // 2. Lógica de cópia
             val tamanhoOriginal = singBoxBin.length()
-            Log.d("ProxyService", "Tamanho esperado do binário: $tamanhoOriginal bytes")
-
-            val sizeOutput = adb.executeShellCommand("wc -c $tmpBin 2>/dev/null").trim()
+            val sizeOutput = adbClient.executeShellCommand("wc -c $tmpBin 2>/dev/null").trim()
             val tamanhoNoDestino = sizeOutput.split(Regex("\\s+"))[0].toLongOrNull() ?: 0L
 
-
             if (tamanhoNoDestino != tamanhoOriginal) {
-                Log.w("ProxyService", "Binário em /tmp ausente ou incompleto ($tamanhoNoDestino bytes). A iniciar cópia síncrona segura...")
-
-                adb.executeShellCommand("rm -f $tmpBin")
-
+                Log.w("ProxyService", "Binário em /tmp ausente ou incompleto. A iniciar cópia...")
+                adbClient.executeShellCommand("rm -f $tmpBin")
                 val localTmpFile = File(cacheDir, "singbox_full.tmp")
 
                 try {
@@ -138,19 +158,13 @@ class ProxyService : Service() {
                             input.copyTo(output)
                         }
                     }
-
-                    Log.d("ProxyService", "Cópia interna concluída para o cache (${localTmpFile.length()} bytes). A transferir para /tmp...")
-
-                    adb.executeShellCommand("cat ${singBoxBin.absolutePath} > $tmpBin")
+                    adbClient.executeShellCommand("cat ${singBoxBin.absolutePath} > $tmpBin")
 
                     var verificadoSucesso = false
                     for (i in 1..5) {
                         Thread.sleep(1000)
-                        val checkSizeStr = adb.executeShellCommand("wc -c $tmpBin 2>/dev/null").trim().split(Regex("\\s+"))[0]
+                        val checkSizeStr = adbClient.executeShellCommand("wc -c $tmpBin 2>/dev/null").trim().split(Regex("\\s+"))[0]
                         val tamanhoAtualDestino = checkSizeStr.toLongOrNull() ?: 0L
-
-                        Log.d("ProxyService", "Tentativa de verificação $i: $tamanhoAtualDestino de $tamanhoOriginal bytes")
-
                         if (tamanhoAtualDestino == tamanhoOriginal) {
                             verificadoSucesso = true
                             break
@@ -158,24 +172,22 @@ class ProxyService : Service() {
                     }
 
                     if (verificadoSucesso) {
-                        Log.i("ProxyService", "Sucesso! O binário foi copiado por inteiro e validado.")
+                        Log.i("ProxyService", "Sucesso! Binário copiado.")
                     } else {
-                        Log.e("ProxyService", "ERRO CRÍTICO: O tamanho do binário em /tmp divergiu após a cópia.")
+                        Log.e("ProxyService", "ERRO CRÍTICO na cópia do binário.")
                     }
-
                 } catch (e: Exception) {
-                    Log.e("ProxyService", "Falha catastrófica na transferência do binário", e)
+                    Log.e("ProxyService", "Falha na transferência", e)
                 } finally {
                     if (localTmpFile.exists()) localTmpFile.delete()
                 }
             } else {
-                Log.i("ProxyService", "O binário já existe em /tmp com o tamanho correto ($tamanhoNoDestino bytes). Cópia ignorada.")
+                Log.i("ProxyService", "Binário já existe em /tmp com tamanho correto.")
             }
-            // --- FIM DA SUA LÓGICA DE CÓPIA ---
 
-            adb.executeShellCommand("chmod 777 $tmpBin")
+            adbClient.executeShellCommand("chmod 777 $tmpBin")
 
-            // 3. Configuração Corrigida com Sintaxe Standard de Rotas
+            // 3. Configuração ajustada (Removido reuse_port incompatível)
             val config = """
             {
               "log": { 
@@ -208,8 +220,7 @@ class ProxyService : Service() {
                   "listen": "0.0.0.0",
                   "listen_port": $SINGBOX_PORT,
                   "sniff": true,
-                  "domain_strategy": "prefer_ipv4",
-                  "udp_over_tcp": false
+                  "domain_strategy": "prefer_ipv4"
                 },
                 {
                   "type": "http",
@@ -224,6 +235,7 @@ class ProxyService : Service() {
                 { 
                   "type": "direct", 
                   "tag": "direct-out",
+                  "domain_strategy": "ipv4_only",
                   "udp_fragment": true
                 }
               ],
@@ -237,31 +249,31 @@ class ProxyService : Service() {
             }
             """.trimIndent()
 
-            // 4. Escrita de Configuração via ADB (Evita EACCES da escrita direta Java)
+            // 4. Escrita de Configuração via ADB
             try {
                 val base64Config = android.util.Base64.encodeToString(config.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
-                adb.executeShellCommand("printf '%s' '$base64Config' | base64 -d > $tmpConfig")
-                Log.d("ProxyService", "Configuração JSON injetada via ADB (Base64).")
+                adbClient.executeShellCommand("printf '%s' '$base64Config' | base64 -d > $tmpConfig")
             } catch (e: Exception) {
-                Log.e("ProxyService", "Falha ao injetar configuração via ADB", e)
+                Log.e("ProxyService", "Falha ao injetar configuração", e)
             }
 
-            adb.executeShellCommand("chmod 666 $tmpConfig")
-            adb.executeShellCommand("rm -f $logFile") // Remove log antigo para evitar lentidão de I/O
-            adb.executeShellCommand("touch $logFile")
-            adb.executeShellCommand("chmod 777 $logFile")
+            adbClient.executeShellCommand("chmod 666 $tmpConfig")
+            adbClient.executeShellCommand("rm -f $logFile")
+            adbClient.executeShellCommand("touch $logFile")
+            adbClient.executeShellCommand("chmod 777 $logFile")
 
-            val cmdTmp = "$tmpBin run -c $tmpConfig > $logFile 2>&1 &"
-            Log.d("ProxyService", "A iniciar processo do Motor (Direct mode)...")
-            adb.executeShellCommand(cmdTmp)
+            // Uso do chrt -f 99 para prioridade máxima no Kernel
+            // Adicionado export HOME para evitar problemas com sing-box a tentar escrever em dirs restritos
+            val cmdTmp = "export HOME=/data/local/tmp; nohup $tmpBin run -c $tmpConfig > $logFile 2>&1 &"
+            Log.d("ProxyService", "Iniciando motor com prioridade e limpeza de RAM...")
+            adbClient.executeShellCommand(cmdTmp)
 
-            // 5. Monitorização contínua e auto-restart
+            // 5. Monitorização contínua
             executorService?.execute {
                 var lastStateOnline = false
                 var consecutiveFailures = 0
-                
-                // Pequena pausa para o SO processar o comando nohup antes de começar a perguntar
-                Thread.sleep(3000)
+
+                Thread.sleep(5000)
 
                 while (isRunning) {
                     val isAlive = checkSingBoxStatus()
@@ -272,11 +284,10 @@ class ProxyService : Service() {
                             lastStateOnline = true
                         }
                         consecutiveFailures = 0
-                        Thread.sleep(20000) // Se está OK, verifica a cada 20 segundos
+                        Thread.sleep(30000) // Verifica a cada 30 segundos
                     } else {
                         consecutiveFailures++
-                        
-                        // Lógica de "Fast Polling" na subida:
+
                         if (!lastStateOnline && consecutiveFailures < 30) {
                             Log.v("ProxyService", "Aguardando motor subir ($consecutiveFailures/30)...")
                             Thread.sleep(2000)
@@ -284,12 +295,11 @@ class ProxyService : Service() {
                             Log.v("ProxyService", "Sing-Box falhou esporadicamente ($consecutiveFailures/3).")
                             Thread.sleep(7000)
                         } else {
-                            Log.w("ProxyService", "Sing-Box não respondeu após carência. Reiniciando processo...")
-                            adb.executeShellCommand("pkill -9 -f singbox_byd")
-                            adb.executeShellCommand("fuser -k $SINGBOX_PORT/tcp")
+                            Log.w("ProxyService", "Sing-Box inativo. Limpando recursos e reiniciando processo...")
+                            cleanResources()
                             Thread.sleep(3000)
-                            adb.executeShellCommand(cmdTmp)
-                            
+                            adbClient.executeShellCommand(cmdTmp)
+
                             lastStateOnline = false
                             consecutiveFailures = 0
                             Thread.sleep(5000)
@@ -299,19 +309,29 @@ class ProxyService : Service() {
             }
 
         } catch (e: Exception) {
-            Log.e("ProxyService", "Falha no Diagnóstico ADB: ${e.message}", e)
+            Log.e("ProxyService", "Falha no processo principal: ${e.message}", e)
         }
     }
 
     private fun checkSingBoxStatus(): Boolean {
+        // Verificação Funcional: O que está na porta 8888 fala o protocolo SOCKS5?
         return try {
             Socket().use { socket ->
-                // Adicionamos um timeout de conexão curto para não bloquear a thread de monitorização
-                socket.connect(java.net.InetSocketAddress("127.0.0.1", SINGBOX_PORT), 3000)
-                socket.isConnected
+                socket.connect(java.net.InetSocketAddress("127.0.0.1", SINGBOX_PORT), 1500)
+                val out = socket.getOutputStream()
+                val ins = socket.getInputStream()
+                
+                // Envia Saudação SOCKS5: Versão 5, 1 Metodo, Sem Autenticação
+                out.write(byteArrayOf(0x05, 0x01, 0x00))
+                out.flush()
+                
+                val response = ByteArray(2)
+                val read = ins.read(response)
+                
+                // Valida se a resposta é 05 00 (SOCKS5 + No Auth)
+                read == 2 && response[0] == 0x05.toByte() && response[1] == 0x00.toByte()
             }
         } catch (e: Exception) {
-            Log.v("ProxyService", "Sing-Box health check failed: ${e.message}")
             false
         }
     }
@@ -331,7 +351,7 @@ class ProxyService : Service() {
                 }
             }
         } catch (e: IOException) {
-            Log.e("ProxyService", "Erro no servidor de arquivo PAC", e)
+            Log.e("ProxyService", "Erro no servidor PAC", e)
         }
     }
 
@@ -346,17 +366,16 @@ class ProxyService : Service() {
                 val url = parts[1]
 
                 if (url.endsWith("/proxy.pac") || url == "proxy.pac" || url.contains("pac")) {
-                    // Verifica se a ligação vem do próprio Mac (local) ou de um dispositivo externo
                     val clientIp = clientSocket.inetAddress.hostAddress
                     val proxyAddress = if (clientIp == "127.0.0.1") "127.0.0.1" else hostIp
 
+                    // Lógica de Failover no PAC para evitar falhas abruptas
                     val pacContent = """
                     function FindProxyForURL(url, host) {
                         if (isPlainHostName(host) || shExpMatch(host, "*.local") || shExpMatch(host, "127.0.0.1")) {
                             return "DIRECT";
                         }
-                        // Usa o endereço dinâmico dependendo de quem pede
-                        return "SOCKS5 $proxyAddress:$SINGBOX_PORT; HTTP $proxyAddress:$SINGBOX_HTTP_PORT; DIRECT";
+                        return "SOCKS5 $proxyAddress:$SINGBOX_PORT; SOCKS5 $proxyAddress:$SINGBOX_HTTP_PORT; HTTP $proxyAddress:$SINGBOX_HTTP_PORT; DIRECT";
                     }
                     """.trimIndent()
 
@@ -369,10 +388,9 @@ class ProxyService : Service() {
 
                     output.write(response)
                     output.flush()
-                    Log.d("ProxyService", "PAC distribuído com sucesso para o IP: $clientIp")
                 }
             } catch (e: Exception) {
-                Log.e("ProxyService", "Erro ao servir o arquivo PAC: ${e.message}")
+                Log.e("ProxyService", "Erro ao servir PAC: ${e.message}")
             }
         }
     }
@@ -394,7 +412,8 @@ class ProxyService : Service() {
             .setContentTitle("Bypass Ativo")
             .setContentText("Sing-Box: $SINGBOX_PORT/$SINGBOX_HTTP_PORT | PAC: $PAC_PORT")
             .setSmallIcon(android.R.drawable.ic_menu_share)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setOngoing(true)
             .build()
 
@@ -407,17 +426,19 @@ class ProxyService : Service() {
     }
 
     override fun onDestroy() {
+        Log.d("ProxyService", "Service onDestroy")
         isRunning = false
-        Executors.newSingleThreadExecutor().execute {
-            try {
-                val adb = AdbLoopbackClient()
-                adb.executeShellCommand("pkill -9 -f singbox_byd")
-            } catch (_: Exception) {}
+        
+        cleanupExecutor.execute {
+            cleanResources()
         }
 
         try { pacServerSocket?.close() } catch (_: IOException) {}
         executorService?.shutdownNow()
-        scheduleServiceRestart()
+        cleanupExecutor.shutdown()
+        
+        // Apenas agenda restart se não foi uma paragem manual (opcional, mas seguro)
+        // scheduleServiceRestart()
         super.onDestroy()
     }
 

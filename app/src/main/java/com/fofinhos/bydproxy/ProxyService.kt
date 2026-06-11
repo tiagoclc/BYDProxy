@@ -27,7 +27,7 @@ class ProxyService : Service() {
     private val cleanupExecutor = Executors.newSingleThreadExecutor()
     private val adbExecutor = AdbShellExecutor(this)
     private var isRunning = false
-
+    private var lastPacLogTime = 0L
     private val SINGBOX_PORT = 8888
     private val SINGBOX_HTTP_PORT = 8887
     private val PAC_PORT = 8880
@@ -142,7 +142,7 @@ class ProxyService : Service() {
                 adbExecutor.executeSync("chmod 777 $tmpBin")
             }
 
-            // Configuração
+            // Configuração com DNS-over-HTTPS (DoH) para contornar restrições do ADB/eSIM
             val config = """
             {
               "log": { 
@@ -152,10 +152,20 @@ class ProxyService : Service() {
               },
               "dns": {
                 "servers": [
-                  { "type": "udp", "tag": "google-dns", "server": "8.8.8.8" },
-                  { "type": "udp", "tag": "cloudflare-dns", "server": "1.1.1.1" }
+                  { 
+                    "type": "https", 
+                    "tag": "cloudflare-doh", 
+                    "server": "1.1.1.1", 
+                    "server_port": 443 
+                  },
+                  { 
+                    "type": "https", 
+                    "tag": "google-doh", 
+                    "server": "8.8.8.8", 
+                    "server_port": 443 
+                  }
                 ],
-                "final": "google-dns",
+                "final": "cloudflare-doh",
                 "strategy": "ipv4_only"
               },
               "inbounds": [
@@ -164,21 +174,22 @@ class ProxyService : Service() {
                   "tag": "socks-in",
                   "listen": "0.0.0.0",
                   "listen_port": $SINGBOX_PORT,
-                  "sniff": false
+                  "sniff": true,
+                  "sniff_override_destination": true
                 },
                 {
                   "type": "http",
                   "tag": "http-in",
                   "listen": "0.0.0.0",
                   "listen_port": $SINGBOX_HTTP_PORT,
-                  "sniff": false
+                  "sniff": true,
+                  "sniff_override_destination": true
                 }
               ],
               "outbounds": [
                 { "type": "direct", "tag": "direct-out" }
               ],
               "route": {
-                "auto_detect_interface": true,
                 "final": "direct-out"
               }
             }
@@ -195,12 +206,12 @@ class ProxyService : Service() {
             executorService?.execute {
                 var lastStateOnline = false
                 var consecutiveFailures = 0
-                
+
                 Log.d("ProxyService", "Iniciando monitorização do Sing-Box...")
 
                 while (isRunning) {
                     val isAlive = checkSingBoxStatus()
-                    
+
                     if (isAlive) {
                         if (!lastStateOnline) {
                             Log.i("ProxyService", "Sing-Box está ONLINE e operacional.")
@@ -210,7 +221,7 @@ class ProxyService : Service() {
                         Thread.sleep(30000)
                     } else {
                         consecutiveFailures++
-                        
+
                         if (!lastStateOnline) {
                             Log.v("ProxyService", "Aguardando motor subir ($consecutiveFailures/30)...")
                             if (consecutiveFailures >= 30) {
@@ -272,25 +283,39 @@ class ProxyService : Service() {
 
     private fun handlePacRequest(socket: Socket) {
         socket.use { clientSocket ->
-            try {
-                val input = clientSocket.getInputStream().bufferedReader()
-                val firstLine = input.readLine() ?: return
-                if (firstLine.contains("proxy.pac") || firstLine.contains("pac")) {
-                    val pacContent = """
-                    function FindProxyForURL(url, host) {
-                        if (isPlainHostName(host) || shExpMatch(host, "*.local") || shExpMatch(host, "127.0.0.1")) {
-                            return "DIRECT";
-                        }
-                        return "SOCKS5 $hostIp:$SINGBOX_PORT; HTTP $hostIp:$SINGBOX_HTTP_PORT; DIRECT";
-                    }
-                    """.trimIndent()
+            var inputReader: java.io.BufferedReader? = null
+            var outputWriter: java.io.BufferedWriter? = null
 
-                    val output = clientSocket.getOutputStream().bufferedWriter()
-                    output.write("HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nConnection: close\r\n\r\n$pacContent")
-                    output.flush()
+            try {
+                inputReader = clientSocket.getInputStream().bufferedReader()
+                val firstLine = inputReader.readLine() ?: return
+
+                if (firstLine.contains("proxy.pac") || firstLine.contains("pac")) {
+                    // Modificado: Prioriza 127.0.0.1 para o tráfego local do próprio carro não morrer
+                    val pacContent = """
+                function FindProxyForURL(url, host) {
+                    if (isPlainHostName(host) || shExpMatch(host, "*.local") || shExpMatch(host, "127.0.0.1")) {
+                        return "DIRECT";
+                    }
+                    return "SOCKS5 127.0.0.1:$SINGBOX_PORT; HTTP 127.0.0.1:$SINGBOX_HTTP_PORT; HTTP $hostIp:$SINGBOX_HTTP_PORT; SOCKS5 $hostIp:$SINGBOX_PORT; DIRECT";
                 }
-            } catch (_: Exception) {
-                Log.e("ProxyService", "Erro ao servir PAC")
+                """.trimIndent()
+
+                    outputWriter = clientSocket.getOutputStream().bufferedWriter()
+                    outputWriter.write("HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nConnection: close\r\n\r\n$pacContent")
+                    outputWriter.flush()
+
+                    val currentTime = SystemClock.elapsedRealtime()
+                    if (currentTime - lastPacLogTime > 10000) {
+                        Log.i("ProxyService", "👉 Ficheiro proxy.pac servido com SUCESSO para o IP: ${clientSocket.inetAddress.hostAddress}")
+                        lastPacLogTime = currentTime
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("ProxyService", "Erro ao servir PAC", e)
+            } finally {
+                try { inputReader?.close() } catch (_: Exception) {}
+                try { outputWriter?.close() } catch (_: Exception) {}
             }
         }
     }

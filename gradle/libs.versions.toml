@@ -7,6 +7,7 @@ espressoCore = "3.7.0"
 appcompat = "1.7.1"
 material = "1.14.0"
 adam = "0.5.10"
+dadb = "1.2.10"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -16,6 +17,7 @@ androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-co
 androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
 material = { group = "com.google.android.material", name = "material", version.ref = "material" }
 adam = { group = "com.malinskiy.adam", name = "adam", version.ref = "adam" }
+dadb = { group = "dev.mobile", name = "dadb", version.ref = "dadb" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

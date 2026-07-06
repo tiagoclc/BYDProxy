@@ -1,4 +1,4 @@
-Proxy para compartilhar a internet via hotspot do BYD Dolphin (e outros com dilink 3).
+Proxy para compartilhar a internet via hotspot do BYD Dolphin (e outros com dilink 3. Não testei em outros carros com dilink 4 e 5).
 
 Instruções:
 
